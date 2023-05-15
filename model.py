@@ -240,7 +240,7 @@ def train(model, train_loader, scheduler, epoch, criterion, device, opt):
     for batch_idx, (emg, label) in tqdm_bar:
         emg = emg.to(device)
         label = F.one_hot(torch.squeeze(label, 1).to(torch.int64),
-                          num_classes=opt.N_CLASS)
+                          num_classes=opt.n_class)
         label = label.to(torch.float64)
         label = label.to(device)
 
@@ -275,7 +275,7 @@ def train(model, train_loader, scheduler, epoch, criterion, device, opt):
 def evaluate(model, test_loader, criterion, device, opt):
     model.eval()
     test_loss = 0.0
-    classes = np.arange(opt.N_CLASS)
+    classes = np.arange(opt.n_class)
 
     correct_pred = {classname: 0 for classname in classes}
     total_pred = {classname: 0 for classname in classes}
@@ -288,7 +288,7 @@ def evaluate(model, test_loader, criterion, device, opt):
             emg = emg.to(device)
             _label = label.to(device)
             label = F.one_hot(torch.squeeze(label, 1).to(torch.int64),
-                              num_classes=opt.N_CLASS)
+                              num_classes=opt.n_class)
             label = label.to(torch.float64)
             label = label.to(device)
 
