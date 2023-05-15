@@ -1,0 +1,12 @@
+wandb/
+*model/
+__pycache__/
+.spyproject/
+
+# Ignore data files
+isometric_hand_gestures/
+
+# Ignore generated docs
+*.txt
+
+
