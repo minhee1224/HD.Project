@@ -37,8 +37,35 @@ hyperparameter_defaults = {
     }
 
 
+force_hyperparameter_defaults = {
+    # Training
+    'RANDOM_STATE': 42,
+    'TEST_RATIO': 0.25,
+    'BATCH_SIZE': 16,
+    'EPOCHS': 300,
+    'LR': 0.0005,
+    # wandb & logging
+    'prj_name': "HD_ViT",
+    'log_interval': 5,
+    # Model
+    'model_dim': 32,
+    'hidden_dim': 128,
+    'hidden1_dim': 256,
+    'hidden2_dim': 256,
+    'n_output': 9,
+    'n_head': 32,
+    'n_layer': 10,
+    'n_patch': 409,
+    'dropout_p': 0.2,
+    'model_dir': "./ViT_model/ViT_test.pt",
+    # Scheduler
+    'n_warmup_steps': 10,
+    'decay_rate': 0.99
+    }
+
+
 sweep_config = {
-    'name': 'ViT1_sweep',
+    'name': 'ViT_subject2_sweep_230529',
     'method': 'random',
     'metric': {
         'name': 'Validation Accuracy',
@@ -46,17 +73,13 @@ sweep_config = {
         },
     'parameters': {
         'LR': {
-            'distribution': 'uniform',
-            'min': 0,
-            'max': 0.0005
+            'values': [0.00001, 0.00005, 0.0001, 0.0005]
             },
         'n_warmup_steps': {
             'values': [5, 10, 15]
             },
         'decay_rate': {
-            'distribution': 'uniform',
-            'min': 0.97,
-            'max': 0.99
+            'values': [0.98, 0.985, 0.99, 0.995]
             },
         # Model
         'model_dim': {
@@ -71,8 +94,101 @@ sweep_config = {
         'n_head': {
             'values': [8, 16, 32]
             },
-        'drop_p': {
+        'dropout_p': {
             'values': [0.1, 0.2, 0.3]
+            },
+        # Default
+        'n_patch': {
+            'values': [409]
+            },
+        'n_class':{
+            'values': [66]
+            },
+        'EPOCHS': {
+            'values': [300]
+            },
+        'BATCH_SIZE': {
+            'values': [16]
+            },
+        'TEST_RATIO': {
+            'values': [0.25]
+            },
+        'RANDOM_STATE': {
+            'values': [42]
+            },
+        'prj_name': {
+            'values': ["HD_ViT"]
+            },
+        'log_interval': {
+            'values': [5]
+            },
+        },
+    }
+
+
+force_sweep_config = {
+    'name': 'ViT_force_sweep_230710',
+    'method': 'random',
+    'metric': {
+        'name': 'Validation Loss',
+        'goal': 'minimize'
+        },
+    'parameters': {
+        'LR': {
+            'values': [0.00001, 0.00005, 0.0001, 0.0005]
+            },
+        'n_warmup_steps': {
+            'values': [5, 10, 15]
+            },
+        'decay_rate': {
+            'values': [0.98, 0.985, 0.99, 0.995]
+            },
+        # Model
+        'model_dim': {
+            'values': [32, 64, 128]
+            },
+        'hidden_dim': {
+            'values': [32, 64, 128, 256]
+            },
+        'hidden1_dim': {
+            'values': [32, 64, 128, 256]
+            },
+        'hidden2_dim': {
+            'values': [32, 64, 128, 256]
+            },
+        'n_layer': {
+            'values': [10, 12, 14]
+            },
+        'n_head': {
+            'values': [8, 16, 32]
+            },
+        'dropout_p': {
+            'values': [0.1, 0.2, 0.3]
+            },
+        # Default
+        'n_patch': {
+            'values': [409]
+            },
+        'n_output':{
+            'values': [9]
+            },
+        'EPOCHS': {
+            'values': [300]
+            },
+        'BATCH_SIZE': {
+            'values': [16]
+            },
+        'TEST_RATIO': {
+            'values': [0.25]
+            },
+        'RANDOM_STATE': {
+            'values': [42]
+            },
+        'prj_name': {
+            'values': ["HD_ViT"]
+            },
+        'log_interval': {
+            'values': [5]
             },
         },
     }

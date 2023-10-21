@@ -7,8 +7,11 @@ Created on Mon May  1 13:38:19 2023
 
 from mat73 import loadmat
 import time
+import numpy as np
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from preprocessing import *
 from config import *
@@ -25,10 +28,13 @@ class DataPredictor:
 
     def model_load(self):
         # model load
-        model = ViT(p=int(8), model_dim=self.opt.model_dim,
-                    hidden_dim=self.opt.hidden_dim, n_class=self.opt.n_class,
-                    n_heads=self.opt.n_head, n_layers=self.opt.n_layer,
-                    n_patches=self.opt.n_patch, dropout_p=self.opt.dropout_p)
+        model = ViT(p=int(8), model_dim=self.opt["model_dim"],
+                    hidden_dim=self.opt["hidden_dim"],
+                    n_class=self.opt["n_class"],
+                    n_heads=self.opt["n_head"],
+                    n_layers=self.opt["n_layer"],
+                    n_patches=self.opt["n_patch"],
+                    dropout_p=self.opt["dropout_p"])
         model.load_state_dict(torch.load(self.model_path))
         model.to(self.device)
         self.model = model
@@ -48,23 +54,37 @@ class DataPredictor:
 
 if __name__ == "__main__":
 
-    data_path = "./isometric_hand_gestures/s1.mat"
-    window_sample, w_emg, label = emg_preprocessing(data_path)
-    # emg shape: data_length * window_sample * 8 * 16
-    model_path_0 = "./ViT_model/ViT_LR0.001_.pt"
-    model_path_1 = "./ViT_model/ViT_LR0.001_.pt"
-    device_0 = torch.device('cuda')
-    device_1 = torch.device('cuda')
-    opt = arg_parse()
-    start_time = time.time()
-    predictor0 = DataPredictor(start_time, model_path_0, opt, device_0)
-    # predictor1 = DataPredictor(start_time, model_path_1, opt, device_1)
-    for x_emg in w_emg:
-        mid_time = time.time()
-        out_0 = predictor0.prediction(x_emg)
-        # out_1 = predictor1.prediction(x_emg)
-    end_time = time.time()
-    print((end_time - mid_time))
-    print((end_time - mid_time)/len(w_emg))
-    print((end_time - start_time))
-    print((end_time - start_time)/len(w_emg))
+    subject_list = ["4"]
+    for sub in subject_list:
+
+        # data_path = "./isometric_hand_gestures/s1.mat"
+        # window_sample, w_emg, label = emg_preprocessing(data_path)
+        emg_path = "./isometric_hand_gestures/s%s_emg.npy" % str(sub)
+        label_path = "./isometric_hand_gestures/s%s_label.npy" % str(sub)
+
+        w_emg = torch.from_numpy(np.load(emg_path))
+        re_w_label = torch.from_numpy(np.load(label_path))
+        
+        n_correct = int(0)
+
+        # emg shape: data_length * window_sample * 8 * 16
+        model_path_0 = "./ViT_model/ViT_s%s_LR0.0001.pt" % str(sub)
+        device_0 = torch.device('cuda')
+        opt = hyperparameter_defaults
+        start_time = time.time()
+        predictor0 = DataPredictor(start_time, model_path_0, opt, device_0)
+
+        for data_num, x_emg in enumerate(w_emg):
+            mid_time = time.time()
+            out_0 = predictor0.prediction(x_emg)
+            _, pred_0 = torch.max(out_0, 1)
+            pred_0 = pred_0.cpu().numpy()[0]
+            if pred_0 == re_w_label[data_num].numpy():
+                n_correct += 1
+            
+        end_time = time.time()
+        print((end_time - mid_time))
+        print((end_time - mid_time)/len(w_emg))
+        print((end_time - start_time))
+        print((end_time - start_time)/len(w_emg))
+        print("Accuracy: %.6f" % float(n_correct/len(w_emg)))
