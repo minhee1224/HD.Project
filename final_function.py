@@ -7,6 +7,7 @@ Created on Tue Oct  3 16:22:59 2023
 
 
 import math
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,10 +18,11 @@ import wandb
 from einops.layers.torch import Rearrange
 from einops import rearrange
 from collections import OrderedDict, Counter
-from scipy import signal
+from scipy import signal, interpolate
 
 
 import torch
+import torch.fx
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset,\
@@ -35,6 +37,208 @@ from sklearn.metrics import mean_squared_error, r2_score
 
 
 from test_data import *
+
+
+################################################################
+################################################################
+# Utils
+################################################################
+################################################################
+
+def create_folder(directory):
+    try:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+    except OSError:
+        print('Error: Creating directory. ' + directory)
+
+
+def basic_interpolation(standard_time: pd.Series,
+                        target_time: pd.Series,
+                        target_data: pd.DataFrame):
+    target_col = target_data.columns
+    if len(target_data) != 1:
+        target_synced = pd.DataFrame(columns=target_col)
+        for t in target_col:
+            temp_data = target_data[str(t)]
+            tmp = np.interp(standard_time, target_time, temp_data)
+            target_synced[str(t)] = tmp
+    else:
+        target_synced = pd.DataFrame(
+            np.zeros(target_synced.shape[0], len(target_col)),
+            columns=target_col)
+    return target_synced
+
+
+def mocap_data_csv_reading(path: str,
+                           column_list: list,
+                           angle_option: int):  # 1: case 1, 2: case 2
+    data = pd.read_csv(path, header=5, sep=",")
+    data.columns = column_list
+    data = data.iloc[:, 1:]
+
+    # shoulder - elbow - wrist
+    if angle_option == 1:
+        data["wrist_x"] =\
+            0.5 * (data["wrist_medial_x"] + data["wrist_lateral_x"])
+        data["wrist_y"] =\
+            0.5 * (data["wrist_medial_y"] + data["wrist_lateral_y"])
+        data["wrist_z"] =\
+            0.5 * (data["wrist_medial_z"] + data["wrist_lateral_z"])
+        length_a = np.sqrt(
+            (data["shoulder_x"] - data["elbow_x"]).pow(2) +
+            (data["shoulder_y"] - data["elbow_y"]).pow(2) +
+            (data["shoulder_z"] - data["elbow_z"]).pow(2)
+            )
+        length_b = np.sqrt(
+            (data["wrist_x"] - data["elbow_x"]).pow(2) +
+            (data["wrist_y"] - data["elbow_y"]).pow(2) +
+            (data["wrist_z"] - data["elbow_z"]).pow(2)
+            )
+        length_c = np.sqrt(
+            (data["shoulder_x"] - data["wrist_x"]).pow(2) +
+            (data["shoulder_y"] - data["wrist_y"]).pow(2) +
+            (data["shoulder_z"] - data["wrist_z"]).pow(2)
+            )
+        data["angle"] = np.arccos(
+            (length_a.pow(2) + length_b.pow(2) - length_c.pow(2)) /
+            (2.0 * length_a * length_b))
+        data["angle"] *= (180.0 / math.pi)
+    # biceps - elbow - forearm
+    elif angle_option == 2:
+        length_a = np.sqrt(
+            (data["biceps_x"] - data["elbow_x"]).pow(2) +
+            (data["biceps_y"] - data["elbow_y"]).pow(2) +
+            (data["biceps_z"] - data["elbow_z"]).pow(2)
+            )
+        length_b = np.sqrt(
+            (data["forearm_x"] - data["elbow_x"]).pow(2) +
+            (data["forearm_y"] - data["elbow_y"]).pow(2) +
+            (data["forearm_z"] - data["elbow_z"]).pow(2)
+            )
+        length_c = np.sqrt(
+            (data["biceps_x"] - data["forearm_x"]).pow(2) +
+            (data["biceps_y"] - data["forearm_y"]).pow(2) +
+            (data["biceps_z"] - data["forearm_z"]).pow(2)
+            )
+        data["angle"] = np.arccos(
+            (length_a.pow(2) + length_b.pow(2) - length_c.pow(2)) /
+            (2.0 * length_a * length_b))
+        data["angle"] *= (180.0 / math.pi)
+
+    return data  # dataframe
+
+
+def strain_mocap_interpolation(strain_data: pd.Series,
+                               mocap_data: pd.DataFrame,
+                               strain_freq=2000.0
+                               ):
+    # time [ms]
+    strain_time = np.linspace(
+        0,
+        (len(strain_data) - 1) * (1000.0 / strain_freq),
+        len(strain_data)
+        )
+    mocap_data["time"] *= 1000
+    f = interpolate.interp1d(strain_time, np.array(strain_data))
+    strain_interp = f(mocap_data.time)
+
+    return pd.Series(strain_interp)  # pd.Series
+
+
+def strain_data_txt_reading(path: str,
+                            sheet_name="Sheet1"
+                            ):
+    if path[-3:] != "txt":
+        data = pd.read_excel(path,
+                             sheet_name=sheet_name,
+                             index_col=None,
+                             header=None)
+    else:
+        data = pd.read_csv(path, sep=" ")
+    data = data.iloc[1:, 1:-2]
+    data = data.iloc[:, -1]  # pd.Series
+    data.name = 'strain'
+
+    return data  # pd.Series
+
+
+def emg_data_txt_reading_231011(path: str,
+                                sheet_name="Sheet1"
+                                ):
+    if path[-3:] != "txt":
+        data = pd.read_excel(path,
+                             sheet_name=sheet_name,
+                             index_col=None,
+                             header=None)
+    else:
+        data = pd.read_csv(path, sep=" ")
+    data = data.iloc[5:, 1:-2]
+    data.columns = ["emg1", "emg2", "emg3", "emg4", "emg5", "emg6",
+                    "emg7", "emg8", "emg9", "emg10", "emg11", "emg12",
+                    "emg13", "emg14", "emg15", "emg16", "emg17", "emg18",
+                    "emg19", "emg20", "emg21", "emg22", "emg23", "emg24",
+                    "emg25", "emg26", "emg27", "emg28", "emg29", "emg30",
+                    "emg31", "emg32", "strain"]
+    data = data.dropna(axis=0)
+    data[list(data.columns)[:-1]] =\
+        (data[list(data.columns)[:-1]] - 32768) * 0.195
+
+    data_list = []
+    data_list.append(data.emg10)
+    data_list.append(data.emg9)
+    data_list.append(data.emg32)
+    data_list.append(data.emg13)
+    data_list.append(data.emg22)
+    data_list.append(data.emg20)
+    data_list.append(data.emg25)
+    data_list.append(data.emg23)
+    data_list.append(data.strain)
+
+    return data_list
+
+
+def emg_data_txt_reading_231012(path: str,
+                                sheet_name="Sheet1"
+                                ):
+    if path[-3:] != "txt":
+        data = pd.read_excel(path,
+                             sheet_name=sheet_name,
+                             index_col=None,
+                             header=None)
+    else:
+        data = pd.read_csv(path, sep=" ")
+    data = data.iloc[5:, 1:-2]
+    data.columns = ["emg1", "emg2", "emg3", "emg4", "emg5", "emg6",
+                    "emg7", "emg8", "emg9", "emg10", "emg11", "emg12",
+                    "emg13", "emg14", "emg15", "emg16", "emg17", "emg18",
+                    "emg19", "emg20", "emg21", "emg22", "emg23", "emg24",
+                    "emg25", "emg26", "emg27", "emg28", "emg29", "emg30",
+                    "emg31", "emg32", "strain"]
+    data = data.dropna(axis=0)
+    data[list(data.columns)[:-1]] =\
+        (data[list(data.columns)[:-1]] - 32768) * 0.195
+
+# number 1: emg 8
+# number 2: emg 11
+# number 3: emg 5
+# number 4: emg 17
+# number 5: emg 14
+# number 6: emg 19
+# number 7: emg 2
+# number 8: emg 29
+    data_list = []
+    data_list.append(data.emg8)
+    data_list.append(data.emg11)
+    data_list.append(data.emg5)
+    data_list.append(data.emg17)
+    data_list.append(data.emg14)
+    data_list.append(data.emg19)
+    data_list.append(data.emg2)
+    data_list.append(data.emg29)
+    data_list.append(data.strain)
+
+    return data_list
 
 
 ################################################################
@@ -129,61 +333,180 @@ class Preprocess:
     # window, numpy array
     def fast_fourier_transform(
             emg_data: np.array,
+            notch_limit=5.0,
             sampling_freq=2000
     ):
-        data_length = len(emg_data)
+        data_length = emg_data.size
         data_time = float(data_length/sampling_freq)  # sec
 
         freq_list = np.arange(data_length)
         freq_list = freq_list/data_time
         freq_list = freq_list[range(int(data_length/2))]
 
-        freq_emg_list = np.fft.fft(list(emg_data))/data_length
+        fft = np.fft.fft(emg_data.tolist())
+        freq_emg_list = abs(fft)/data_length
         freq_emg_list = freq_emg_list[range(int(data_length/2))]
-        return freq_list, abs(freq_emg_list)  # x_data, y_data
+
+        # notch freq
+        notch_index = np.where(abs(freq_emg_list) > notch_limit)[0]
+        notch_freq_list = freq_list[notch_index]
+
+        return freq_list, abs(freq_emg_list), notch_freq_list
+        # x_data, y_data, notch_freq
 
     @staticmethod
     def fft_plotting(
             x_data: np.array,
             y_data: np.array,
             title: str,
+            lowest_freq=30,
+            highest_freq=250,
             save_path=None
     ):
-        plt.figure(figsize=(12, 5))
+        # plt.figure(figsize=(12, 5))
         plt.plot(x_data, y_data)
         plt.title(title)
         plt.xlabel("Frequency [Hz]")
         plt.ylabel("Intensity")
+        plt.xlim([lowest_freq, highest_freq])
+        plt.ylim([0, 16])
         if save_path is not None:
             plt.savefig(save_path)
         plt.show()
         return 0
 
     @staticmethod
+    def fft_list_subplots(
+            x_data: list,  # set * emg number * freq list
+            y_data: list,
+            title: str,  # '[FFT] EMG before preprocessing'
+            save_path: str,  # './Test_data/graph/1013/number_'
+            lowest_freq=30,
+            highest_freq=250
+    ):
+        # For comparison between test sets
+        for emg_ind in np.arange(1, len(x_data[0]) + 1):
+            # FFT plot
+            fig_fft, axs = plt.subplots(
+                ((len(x_data) + 1) // 2), 2, sharex=True, figsize=(80, 100))
+            fig_fft.suptitle(title + "_number_" + str(emg_ind), fontsize=80)
+            for set_ind in np.arange(len(x_data)):
+                j = set_ind // 2
+                k = set_ind % 2
+                axs[j, k].plot(
+                    x_data[set_ind][emg_ind - 1],
+                    y_data[set_ind][emg_ind - 1],
+                    label="test set" + str(set_ind + 1)
+                    )
+                axs[j, k].set_ylabel("Intensity", fontsize=50)
+                axs[j, k].set_xlabel("Frequency [Hz]", fontsize=50)
+                axs[j, k].legend(loc="best", fontsize=50)
+                axs[j, k].set_xlim(
+                    [lowest_freq, highest_freq]
+                    )
+                axs[j, k].set_ylim([0, 20])
+                axs[j, k].tick_params(axis="x", labelsize=50)
+                axs[j, k].tick_params(axis="y", labelsize=50)
+            fig_fft.tight_layout()
+            fig_fft.savefig(
+                save_path + "EMG_" + str(emg_ind) + "_" + title + '.png'
+                )
+            plt.close()
+
+        # For comparison between test sets
+        for set_ind in np.arange(len(x_data)):
+            # FFT plot
+            fig_fft, axs = plt.subplots(
+                (len(x_data[0]) // 2), 2, sharex=True, figsize=(80, 100))
+            fig_fft.suptitle(title + "_set_" + str(set_ind + 1), fontsize=80)
+            for emg_ind in np.arange(len(x_data[0])):
+                j = emg_ind // 2
+                k = emg_ind % 2
+                axs[j, k].plot(
+                    x_data[set_ind][emg_ind],
+                    y_data[set_ind][emg_ind],
+                    label="EMG number" + str(emg_ind + 1)
+                    )
+                axs[j, k].set_ylabel("Intensity", fontsize=50)
+                axs[j, k].set_xlabel("Frequency [Hz]", fontsize=50)
+                axs[j, k].legend(loc="best", fontsize=50)
+                axs[j, k].set_xlim(
+                    [lowest_freq, highest_freq]
+                    )
+                axs[j, k].set_ylim([0, 20])
+                axs[j, k].tick_params(axis="x", labelsize=50)
+                axs[j, k].tick_params(axis="y", labelsize=50)
+            fig_fft.tight_layout()
+            fig_fft.savefig(
+                save_path + "SET_" + str(set_ind + 1) + "_" + title + '.png'
+                )
+            plt.close()
+
+    @staticmethod
     # numpy array
     def remove_mean(
             data: np.array
     ):
-        data -= np.mean(data)
+        data -= np.mean(data, axis=0)
         return data
 
     @staticmethod
     # numpy array
     def notch_filter(
             data: np.array,
+            quality_value: float,  # 0.001 or 0.0015
             notch_freq=50,
             lowest_freq=30,
             highest_freq=250,
             sampling_freq=2000,
             normalized=False
     ):
-        quality_factor = notch_freq/(highest_freq - lowest_freq)
-        notch_freq = notch_freq/(sampling_freq/2) if normalized else notch_freq
+        if (
+                ((notch_freq % 60) > 0) &
+                ((notch_freq % 60) <= 0.05)
+                ) |\
+            (
+                ((60.0 - (notch_freq % 60)) > 0) &
+                ((60.0 - (notch_freq % 60)) <= 0.05)
+                ):
+            print(notch_freq)
+            quality_factor =\
+                notch_freq / ((highest_freq - lowest_freq) * quality_value)
+            print(quality_factor)
+            notch_freq = notch_freq / (sampling_freq / 2) if\
+                normalized else notch_freq
 
-        numerator, denominator =\
-            signal.iirnotch(notch_freq, quality_factor, sampling_freq)
-        filtered_data = signal.lfilter(numerator, denominator, data)
+            numerator, denominator =\
+                signal.iirnotch(notch_freq, quality_factor, sampling_freq)
+            filtered_data = signal.lfilter(numerator, denominator, data)
+        else:
+            filtered_data = data
         return filtered_data
+
+    # @staticmethod
+    # numpy array, bandstop filter
+    # def notch_filter(
+    #         data: np.array,
+    #         notch_freq=50,
+    #         sampling_freq=2000,
+    #         order=4
+    #         ):
+
+    #     highcut = round(notch_freq, 1)
+    #     lowcut = highcut - 0.1
+
+    #     nyq = 0.5 * sampling_freq
+    #     low = lowcut / nyq
+    #     high = highcut / nyq
+
+    #     if high < 1.0:
+    #         numerator, denominator =\
+    #             signal.butter(order, [low, high], btype='bandstop')
+    #         filtered_data = signal.lfilter(numerator, denominator, data)
+    #     else:
+    #         filtered_data = data
+
+    #     return filtered_data
 
     @staticmethod
     # numpy array
@@ -295,12 +618,17 @@ class Preprocess:
         calib_data.reset_index(drop=True, inplace=True)
         #######################################################
         # data division for uniform sampling
+        # plt.plot(calib_data.angle)
         min_angle = np.min(calib_data.angle)
         max_angle = np.max(calib_data.angle)
         extra_angle = (max_angle - min_angle) * 0.001
         delta_angle = (
             max_angle - min_angle + extra_angle
         ) / data_division_num
+        print(min_angle)
+        print(extra_angle)
+        print(delta_angle)
+        print(max_angle)
         calib_data["label"] = pd.cut(
             calib_data.angle,
             bins=np.arange(
@@ -361,8 +689,106 @@ class Preprocess:
         ]
 
     @staticmethod
+    def each_mvc_calculation(
+            data: pd.DataFrame,
+            mvc_limit: float,
+            mvc_quality_value: float,
+            height_number=4,
+            width_number=8,
+            sampling_freq=2000,  # hz
+            lowest_freq=30,
+            highest_freq=250,
+            bandpass_order=4,
+            smoothing_window=10.0  # ms
+    ):
+        mvc_list = list()
+        # emg 1~32
+        for emg_index in np.arange(height_number*width_number):
+            each_data = np.array(data.iloc[:, emg_index].values)
+            # FFT
+            freq_x, freq_y, notch_f = Preprocess.fast_fourier_transform(
+                emg_data=each_data,
+                notch_limit=5.0,
+                sampling_freq=sampling_freq
+                )
+            # Remove mean
+            each_data = Preprocess.remove_mean(
+                data=each_data
+                )
+            # Bandpass filter
+            each_data = Preprocess.bandpass_filter(
+                data=each_data,
+                low_f=lowest_freq,
+                high_f=highest_freq,
+                order=bandpass_order,
+                sampling_freq=sampling_freq,
+                normalized=True
+                )
+            # Notch filter
+            for each_notch_f in notch_f:
+                each_data = Preprocess.notch_filter(
+                    data=each_data,
+                    quality_value=mvc_quality_value,
+                    notch_freq=each_notch_f,
+                    lowest_freq=lowest_freq,
+                    highest_freq=highest_freq,
+                    sampling_freq=sampling_freq
+                    )
+            # Rectification
+            each_data = Preprocess.rectification(
+                data=each_data
+                )
+            # Moving rms smoothing
+            each_data = Preprocess.moving_rms_smoothing(
+                data=each_data,
+                smoothing_window=smoothing_window,
+                sampling_freq=sampling_freq
+                )
+            # MVC calculation
+            each_data = each_data[each_data > mvc_limit]
+            each_mvc = np.mean(each_data)
+            mvc_list.append(each_mvc)
+        return np.array(mvc_list)
+
+    @staticmethod
+    def mvc_calculation(
+            data_list: list,
+            mvc_limit: float,
+            mvc_quality_value: float,
+            height_number=4,
+            width_number=8,
+            sampling_freq=2000,  # hz
+            lowest_freq=30,
+            highest_freq=250,
+            bandpass_order=4,
+            smoothing_window=10.0  # ms
+            ):
+        print("mvc calculation")
+        print(len(data_list))
+        for mvc_ind in np.arange(len(data_list)):
+            mvc_value = Preprocess.each_mvc_calculation(
+                data_list[mvc_ind],
+                mvc_limit,
+                mvc_quality_value,
+                height_number=height_number,
+                width_number=width_number,
+                sampling_freq=sampling_freq,  # hz
+                lowest_freq=lowest_freq,
+                highest_freq=highest_freq,
+                bandpass_order=bandpass_order,
+                smoothing_window=smoothing_window  # ms
+                )
+            if mvc_ind == 0:
+                mvc_value_list = mvc_value
+            else:
+                mvc_value_list += mvc_value
+        mvc_value_list /= len(data_list)
+        return mvc_value_list  # np.array
+
+    @staticmethod
     def emg_preprocess(
             data: pd.DataFrame,  # emg 1~32
+            mvc_data_list: list,  # list of dataframes
             train_sample: int,
             train_sample_per_label: int,
             window_sample: int,
@@ -370,13 +796,28 @@ class Preprocess:
             height_number=4,
             width_number=8,
             sampling_freq=2000,  # hz
-            notch_freq=50,
             lowest_freq=30,
             highest_freq=250,
             bandpass_order=4,
-            smoothing_window=10.0  # ms
+            smoothing_window=10.0,  # ms
+            mvc_limit=25.0,  # uV
+            mvc_quality_value=0.001,
+            quality_value=0.0015
     ):
 
+        # MVC calculation
+        mvc_value_list = Preprocess.mvc_calculation(
+            data_list=mvc_data_list,
+            mvc_limit=mvc_limit,
+            mvc_quality_value=mvc_quality_value,
+            height_number=height_number,
+            width_number=width_number,
+            sampling_freq=sampling_freq,  # hz
+            lowest_freq=lowest_freq,
+            highest_freq=highest_freq,
+            bandpass_order=bandpass_order,
+            smoothing_window=smoothing_window  # ms
+            )
         emg_list = list()
         # emg 1~32
         for emg_index in np.arange(height_number*width_number):
@@ -398,10 +839,11 @@ class Preprocess:
                 ####################################################
                 #                    FFT                           #
                 ####################################################
-                # freq_x, freq_y = Preprocess.fast_fourier_transform(
-                #     emg_data=each_window_index,
-                #     sampling_freq=sampling_freq
-                #     )
+                freq_x, freq_y, notch_f = Preprocess.fast_fourier_transform(
+                    emg_data=each_window_data,
+                    notch_limit=2.5,
+                    sampling_freq=sampling_freq
+                    )
                 # Preprocess.fft_plotting(
                 #     x_data=freq_x,
                 #     y_data=freq_y,
@@ -419,14 +861,16 @@ class Preprocess:
                     sampling_freq=sampling_freq,
                     normalized=True
                 )
-                each_window_data = Preprocess.notch_filter(
-                    data=each_window_data,
-                    notch_freq=notch_freq,
-                    lowest_freq=lowest_freq,
-                    highest_freq=highest_freq,
-                    sampling_freq=sampling_freq,
-                    normalized=True
-                )
+                for notch_freq in notch_f:
+                    each_window_data = Preprocess.notch_filter(
+                        data=each_window_data,
+                        quality_value=quality_value,
+                        notch_freq=notch_freq,
+                        lowest_freq=lowest_freq,
+                        highest_freq=highest_freq,
+                        sampling_freq=sampling_freq,
+                        normalized=True
+                    )
                 each_window_data = Preprocess.rectification(
                     data=each_window_data
                 )
@@ -438,7 +882,8 @@ class Preprocess:
 
                 standard_value = Preprocess.standard_value_calculation(
                     data=each_window_data,
-                    mvc_flag=False
+                    mvc_flag=True,
+                    mvc_value=mvc_value_list[emg_index]
                 )
                 each_window_data = Preprocess.normalization(
                     data=each_window_data,
@@ -534,6 +979,7 @@ class Preprocess:
     @staticmethod
     def total_preprocess(
             emg_data: pd.DataFrame,  # emg 1~32
+            mvc_data_list: list,  # list of dataframes
             strain_data: pd.Series,
             polynomial_coeffi: list,  # bias, first order, second order, ...
             emg_height_number=4,
@@ -545,11 +991,13 @@ class Preprocess:
             overlapping_ratio=0.75,
             time_advance=100,  # ms
             label_half_size=5,  # ms
-            notch_freq=50,
             lowest_freq=30,
             highest_freq=250,
             bandpass_order=4,
-            smoothing_window=10.0  # ms
+            smoothing_window=10.0,  # ms
+            mvc_limit=25.0,  # uV
+            mvc_quality_value=0.001,
+            quality_value=0.0015
     ):
 
         [
@@ -566,6 +1014,7 @@ class Preprocess:
 
         final_emg_data = Preprocess.emg_preprocess(
             data=emg_data,
+            mvc_data_list=mvc_data_list,
             train_sample=train_sample,
             train_sample_per_label=train_sample_per_label,
             window_sample=window_sample,
@@ -573,11 +1022,13 @@ class Preprocess:
             height_number=emg_height_number,
             width_number=emg_width_number,
             sampling_freq=sampling_freq,
-            notch_freq=notch_freq,
             lowest_freq=lowest_freq,
             highest_freq=highest_freq,
             bandpass_order=bandpass_order,
-            smoothing_window=smoothing_window
+            smoothing_window=smoothing_window,
+            mvc_limit=mvc_limit,
+            mvc_quality_value=mvc_quality_value,
+            quality_value=quality_value
         )
         final_strain_data, final_strain_label = Preprocess.strain_preprocess(
             data=strain_data,
@@ -603,6 +1054,11 @@ class Preprocess:
 # Model
 ################################################################
 ################################################################
+
+
+@torch.fx.wrap
+def torch_randn(shape):
+    return torch.randn(shape)
 
 
 class mySequential(nn.Sequential):
@@ -650,10 +1106,10 @@ class Embeddings(nn.Module):
                 })
         )
         self.cls_token = nn.Parameter(
-            torch.randn(1, 1, self.model_dim)
+            torch_randn((1, 1, self.model_dim))
         )  # 1 * (1 * D)
         self.pos_token = nn.Parameter(
-            torch.randn(1, 1, self.model_dim)
+            torch_randn((1, 1, self.model_dim))
         )  # 1 * (1 * D)
         self.dropout = nn.Dropout(self.dropout_p)
 
@@ -861,6 +1317,8 @@ class ViT_Regression(nn.Module):
         )
 
     def forward(self, emg_input, strain_input):
+        # emg_input = inputs[0]
+        # strain_input = inputs[1]
         return self.vit_regress(emg_input, strain_input)
 
 
@@ -924,6 +1382,7 @@ def train(
         label = label.to(device)
 
         scheduler.zero_grad()
+        # inputs = [emg, strain]
         output = model(emg, strain)
         loss = criterion(output, label)
         train_loss += loss.item()
@@ -976,6 +1435,10 @@ def evaluate(
             print(label)
             label = label.to(device)
 
+            # inputs = [emg, strain]
+            # print("input")
+            # print(emg.shape)
+            # print(strain.shape)
             output = model(emg, strain)
             print("output")
             print(output)
@@ -1042,12 +1505,73 @@ class RMSELoss(nn.Module):
         return loss.to(torch.float32)
 
 
+# class DataPredictor:
+#     def __init__(self, test_dataloader, model_path, opt, device):
+#         self.model_path = model_path
+#         self.test_dataloader = test_dataloader
+#         self.opt = opt
+#         self.device = device
+#         self.model_load()
+#         self.data_loader()
+
+#     def model_load(self):
+#         model = ViT_Regression(
+#             p=self.opt["patch_size"],
+#             model_dim=self.opt["model_dim"],
+#             hidden_dim=self.opt["hidden_dim"],
+#             hidden1_dim=self.opt["hidden1_dim"],
+#             hidden2_dim=self.opt["hidden2_dim"],
+#             n_output=self.opt["n_output"],
+#             n_heads=self.opt["n_heads"],
+#             n_layers=self.opt["n_layers"],
+#             n_patches=int(np.floor(float(
+#                 self.opt["window_size"] /
+#                 float(1000.0 / self.opt["sampling_freq"])
+#                 ))),
+#             dropout_p=self.opt["dropout_p"],
+#             training_phase='p',
+#             pool='mean',
+#             drop_hidden=True
+#             )
+#         model.load_state_dict(
+#             torch.load(self.model_path, map_location=self.device)
+#             )
+#         model.to(self.device)
+#         self.model = model
+#         self.criterion = RMSELoss()
+
+#     def data_loader(self):
+#         test_dataloader = DataLoader(
+#             self.test_dataset,
+#             batch_size=1,
+#             drop_last=True,
+#             collate_fn=CustomDataset()
+#             )
+#         self.test_dataloader = test_dataloader
+
+#     def prediction(self):
+#         test_loss = []
+#         self.model.eval()
+#         with torch.no_grad():
+#             for idx, (emg, strain, label) in\
+#                 tqdm(enumerate(self.test_dataloader)):
+#                     emg = emg.to(self.device)
+#                     strain = strain.to(self.device)
+#                     label = label.to(torch.float32)
+#                     label = label.tp(self.device)
+#                     output = self.model(emg, strain)
+#                     loss = self.criterion(output, label)
+#                     test_loss.append(loss)
+#         return test_loss
+
+
 def testset_prediction(
         model, test_loader, criterion, device,
         wandb_set=False
         ):
     model.eval()
     test_loss = 0.0
+    test_loss_list = []
 
     tqdm_bar = tqdm(enumerate(test_loader))
 
@@ -1061,12 +1585,14 @@ def testset_prediction(
             print(label)
             label = label.to(device)
 
+            # inputs = [emg, strain]
             output = model(emg, strain)
             print("output")
             print(output)
 
             loss = criterion(output, label)
             test_loss += loss.item()
+            test_loss_list.append(loss.item())
             tqdm_bar.set_description(
                 "Test step: {} || Test loss: {:.6f}".format(
                     (batch_idx + 1) / len(test_loader), loss.item()
@@ -1074,6 +1600,8 @@ def testset_prediction(
                 )
 
     test_loss /= len(test_loader.dataset)
+    print("number of test dataset")
+    print(len(test_loader.dataset))
     if wandb_set == 1:
         wandb.log(
             {
@@ -1082,7 +1610,7 @@ def testset_prediction(
             }
         )
 
-    return test_loss
+    return test_loss, test_loss_list
 
 
 def plot_history(history, name):
@@ -1101,6 +1629,7 @@ def plot_history(history, name):
     ax2.set_xlabel("iterations")
     ax2.set_ylabel("LR")
     plt.show()
+    plt.close()
 
 
 # argument number: 25
@@ -1206,7 +1735,7 @@ def ViT_training(
         collate_fn=dataset.collate_fn
         )
     test_dataloader = DataLoader(
-        test_dataset, batch_size=batch_size,
+        test_dataset, batch_size=1,
         drop_last=True, collate_fn=dataset.collate_fn
         )
 
@@ -1269,7 +1798,7 @@ def ViT_training(
             if patience >= 10:
                 break
 
-    final_test_loss = testset_prediction(
+    final_test_loss, test_loss_list = testset_prediction(
         model, test_dataloader, criterion,
         device, wandb_set)
 
@@ -1277,7 +1806,7 @@ def ViT_training(
     if model_save_dir is not None:
         torch.save(model.state_dict(), model_save_dir)
 
-    return test_loss, history, final_test_loss
+    return test_loss, history, final_test_loss, test_loss_list
 
 
 ################################################################
@@ -1325,6 +1854,7 @@ def main(
         model_save_dir: str,
         history_title: str,
         main_emg_data: pd.DataFrame,
+        mvc_data_list: list,  # list of dataframes
         main_strain_data: pd.Series,
         calib_strain_data: np.array,
         calib_angle_data: np.array
@@ -1344,6 +1874,7 @@ def main(
     window_sample, emg_data, strain_data, strain_label =\
         Preprocess.total_preprocess(
             emg_data=main_emg_data,
+            mvc_data_list=mvc_data_list,
             strain_data=main_strain_data,
             polynomial_coeffi=polynomial_coeffi,
             emg_height_number=hyperparameter_defaults["emg_height_number"],
@@ -1359,11 +1890,13 @@ def main(
             overlapping_ratio=hyperparameter_defaults["overlapping_ratio"],
             time_advance=hyperparameter_defaults["time_advance"],
             label_half_size=hyperparameter_defaults["label_half_size"],
-            notch_freq=hyperparameter_defaults["notch_freq"],
             lowest_freq=hyperparameter_defaults["lowest_freq"],
             highest_freq=hyperparameter_defaults["highest_freq"],
             bandpass_order=hyperparameter_defaults["bandpass_order"],
-            smoothing_window=hyperparameter_defaults["smoothing_window"]
+            smoothing_window=hyperparameter_defaults["smoothing_window"],
+            mvc_limit=hyperparameter_defaults["mvc_limit"],
+            mvc_quality_value=hyperparameter_defaults["mvc_quality_value"],
+            quality_value=hyperparameter_defaults["quality_value"]
         )
     #############################
     # vit training
@@ -1384,7 +1917,7 @@ def main(
         w_config = wandb.config
         n_patches = window_sample  # FIXED
 
-        test_loss, history, final_test_loss =\
+        test_loss, history, final_test_loss, test_loss_list =\
             ViT_training(
                 w_config, wandb_set, model_save_dir,
                 emg=emg_data, strain=strain_data, label=strain_label,
@@ -1420,11 +1953,12 @@ def main(
         print(df_loss)
         plot_history(history, history_title)
         wandb.run.finish()
+
     else:
         w_config = hyperparameter_defaults
         n_patches = window_sample  # FIXED
 
-        test_loss, history, final_test_loss =\
+        test_loss, history, final_test_loss, test_loss_list =\
             ViT_training(
                 w_config, wandb_set, model_save_dir,
                 emg=emg_data, strain=strain_data, label=strain_label,
@@ -1460,81 +1994,272 @@ def main(
         print(df_loss)
         plot_history(history, history_title)
 
+    # test loss for logging
+    # predictor = DataPredictor(
+    #     test_dataset,
+    #     model_save_dir,
+    #     hyperparameter_defaults,
+    #     device)
+    # test_loss_list = predictor.prediction()
+    plt.plot(test_loss_list)
+    print("Test loss one by one")
+    print("Maximum loss")
+    print(np.max(np.abs(test_loss_list)))
+    print("Mean loss")
+    print(np.mean(np.abs(test_loss_list)))
+
+################################################################
+################################################################
+# Main
+################################################################
+################################################################
+
+hyperparameter_defaults = {
+    # Training
+    'random_state': 42,
+    'data_division_num': 10.0,
+    'pool': 'mean',  # or 'cls'
+    'test_size': 0.35,
+    'batch_size': 16,
+    'epochs': 300,
+    'learning_rate': 0.001,
+    # wandb & logging
+    'prj_name': "HD_ViT",
+    'log_interval': 5,
+    # Model
+    'patch_size': 2,  # p
+    'model_dim': 32,
+    'hidden_dim': 64,
+    'hidden1_dim': 16,
+    'hidden2_dim': 4,
+    'n_output': 1,
+    'n_heads': 8,
+    'n_layers': 10,
+    'dropout_p': 0.2,
+    'model_save_dir': "./ViT_model/2310012_test1_ViT.pt",
+    # Scheduler
+    'n_warmup_steps': 10,
+    'decay_rate': 0.99,
+    # Strain calibration
+    'polynomial_order': 2,
+    # preprocessing parameters
+    "emg_height_number": 2,  # 4
+    "emg_width_number": 4,  # 8
+    "strain_height_number": 1,
+    "strain_width_number": 1,
+    "sampling_freq": 2000,  # hz
+    "window_size": 200,  # ms
+    "overlapping_ratio": 0.75,
+    "time_advance": 100,  # ms
+    "label_half_size": 5,  # ms
+    "lowest_freq": 30,
+    "highest_freq": 250,
+    "bandpass_order": 4,
+    "smoothing_window": 10.0,  # ms
+    "data_list": [1, 2, 3, 4, 5],
+    "data_valley_index_dict": {
+        1: [[0, -7], [-5, -1]],
+        2: [[1, -2]],
+        3: [[1, -1]],
+        4: [[0, -2]],
+        5: [[0, -1]]
+        },
+    "mvc_data_list": [1, 2, 3],
+    "mvc_limit": 50.0,  # uV
+    "mvc_quality_value": 0.001,
+    "quality_value": 0.0015
+    }
 
 if __name__ == "__main__":
 
-    hyperparameter_defaults = {
-        # Training
-        'random_state': 42,
-        'data_division_num': 10.0,
-        'pool': 'mean',  # or 'cls'
-        'test_size': 0.35,
-        'batch_size': 16,
-        'epochs': 300,
-        'learning_rate': 0.001,
-        # wandb & logging
-        'prj_name': "HD_ViT",
-        'log_interval': 5,
-        # Model
-        'patch_size': 2,  # p
-        'model_dim': 32,
-        'hidden_dim': 64,
-        'hidden1_dim': 16,
-        'hidden2_dim': 4,
-        'n_output': 1,
-        'n_heads': 8,
-        'n_layers': 10,
-        'dropout_p': 0.2,
-        'model_save_dir': "./ViT_model/2310012_test1_ViT.pt",
-        # Scheduler
-        'n_warmup_steps': 10,
-        'decay_rate': 0.99,
-        # Strain calibration
-        'polynomial_order': 2,
-        # preprocessing parameters
-        "emg_height_number": 2,  # 4
-        "emg_width_number": 4,  # 8
-        "strain_height_number": 1,
-        "strain_width_number": 1,
-        "sampling_freq": 2000,  # hz
-        "window_size": 200,  # ms
-        "overlapping_ratio": 0.75,
-        "time_advance": 100,  # ms
-        "label_half_size": 5,  # ms
-        "notch_freq": 50,
-        "lowest_freq": 30,
-        "highest_freq": 250,
-        "bandpass_order": 4,
-        "smoothing_window": 10.0  # ms
-        }
-
-    model_save_dir = "./ViT_model/231013_test1(231012)_ViT_LR%s.pt" %\
+    model_save_dir = "./ViT_model/231021_trial1_2(231013)_ViT_LR%s.pt" %\
         str(hyperparameter_defaults["learning_rate"])
-    history_title = "231013_test1(231012)_ViT_LR_%s" %\
+    history_title = "231021_trial1_2(231013)_ViT_LR_%s" %\
         str(hyperparameter_defaults["learning_rate"])
 
+    #############################
+    # Path Reading
+    #############################
+    mvc_path = './Test_data/1013/1013_HSJ_312_test_MVC_'
+    mvc_sheet = ""
+
+    main_path = "./Test_data/1013/1013_HSJ_312_test_set"
+    main_sheet = ""
+
+    strain_calib_txt_path =\
+        './Test_data/1013/1013_HSJ_314_strain_calibration.txt'
+    mocap_calib_csv_path = './Test_data/1013/HSJ_Mocap_after_EMG.csv'
+    mocap_column_list = [
+        "frame", "time",
+        "biceps_x", "biceps_y", "biceps_z",
+        "elbow_x", "elbow_y", "elbow_z",
+        "forearm_x", "forearm_y", "forearm_z",
+        "shoulder_x", "shoulder_y", "shoulder_z",
+        "wrist_lateral_x", "wrist_lateral_y", "wrist_lateral_z",
+        "wrist_medial_x", "wrist_medial_y", "wrist_medial_z"]
+    mocap_index_list = [
+        [400, 18500],
+        [20000, 23500],
+        [27500, 41200],
+        [53000, 61800],
+        [71800, 81200],
+        [87800, 90200],
+        [91100, 98400],
+        [104200, 109800]
+        ]
     #############################
     # Data Reading
     #############################
+    # data list for emg mvc
+    mvc_list = list()
+    for mvc_ind in hyperparameter_defaults["mvc_data_list"]:
+        each_mvc_path = mvc_path + str(mvc_ind) + '.txt'
+        mvc_data_list = emg_data_txt_reading_231011(
+             each_mvc_path, mvc_sheet
+             )
+        mvc_df = pd.DataFrame()
+        for i in np.arange(len(mvc_data_list) - 1):
+            mvc_df["emg" + str(i + 1)] = mvc_data_list[i]
+        mvc_df.reset_index(drop=True, inplace=True)
+        mvc_list.append(mvc_df)  # list(dataframe)
+    #############################
     # data for emg + strain
-    main_path = "./Test_data/1012.xlsx"
-    main_sheet = "1012_HSJ_prior_test_sleeve"
-
-    main_data_list = emg_data_txt_reading_231012(main_path, main_sheet)
     main_df = pd.DataFrame()
-    for i in np.arange(len(main_data_list) - 1):
-        main_df["emg" + str(i + 1)] = main_data_list[i]
-    main_df["strain"] = main_data_list[-1]
+    for main_ind in hyperparameter_defaults["data_list"]:
+        each_main_path = main_path + str(main_ind) + '.txt'
+        main_data_list = emg_data_txt_reading_231011(
+            each_main_path, main_sheet
+            )
 
-    # data for strain & angle (mocap)
-    # strain_calib_csv_path = ...
-    # mocap_calib_csv_path = ...
+        # data indexing (peak)
+        peaks, _ = signal.find_peaks(
+            main_data_list[-1], prominence=300.0
+            )
+        new_peak = []
+        for peak_ind, peak in enumerate(peaks):
+            if peak_ind == 0:
+                new_peak.append(peak)
+                continue
+            if peak - new_peak[-1] <= 2000:
+                continue
+            new_peak.append(peak)
+        # data indexing (valley)
+        valleys, _ = signal.find_peaks(
+            (-1) * main_data_list[-1], prominence=100.0
+            )
+        new_valley = []
+        for valley_ind, valley in enumerate(valleys):
+            if valley_ind == 0:
+                new_valley.append(valley)
+                continue
+            if valley - new_valley[-1] <= 2000:
+                continue
+            new_valley.append(valley)
+
+        # Append main_df
+        for append_num in np.arange(
+                len(hyperparameter_defaults["data_valley_index_dict"]
+                    [main_ind])
+                ):
+            start_index = hyperparameter_defaults["data_valley_index_dict"]\
+                [main_ind][append_num][0]
+            end_index = hyperparameter_defaults["data_valley_index_dict"]\
+                [main_ind][append_num][1]
+
+            if len(main_df) == 0:
+                for i in np.arange(len(main_data_list) - 1):
+                    main_df["emg" + str(i + 1)] =\
+                        main_data_list[i][start_index:end_index + 1]
+                main_df["strain"] =\
+                    main_data_list[-1][start_index:end_index + 1]
+            else:
+                for i in np.arange(len(main_data_list) - 1):
+                    main_df["emg" + str(i + 1)] =\
+                        main_df["emg" + str(i + 1)].append(
+                            pd.Series(
+                                main_data_list[i][start_index:end_index + 1]
+                                ),
+                            ignore_index=True
+                            )
+                main_df["strain"] = main_df["strain"].append(
+                    pd.Series(
+                        main_data_list[-1][start_index:end_index + 1]
+                        ),
+                    ignore_index=True
+                    )
+    #############################
+    # data for strain & angle (mocap) -- strain
+    calib_df = pd.DataFrame()
+    strain_calib = strain_data_txt_reading(
+        path=strain_calib_txt_path,
+        sheet_name="")
+    # time [ms]
+    strain_calib_time = np.linspace(
+        0,
+        (len(strain_calib) - 1) *
+        (1000.0 / hyperparameter_defaults["sampling_freq"]),
+        len(strain_calib)
+        )
+    #############################
+    # By index
+    # part 1: 7000:310000
+    # part 2: 458000:688000
+    # part 3: 884000:1030000
+    # part 4: 1196000:1354000
+    # part 5: 1465000:1504000
+    # part 6: 1518000:1641000
+    # part 7: 1736500:1825000
+
+    #############################
+    # data for strain & angle (mocap) -- mocap
+    mocap_calib = mocap_data_csv_reading(
+        mocap_calib_csv_path,
+        mocap_column_list,
+        angle_option=2  # biceps-elbow-forearm
+        )
+    mocap_calib = mocap_calib[
+        mocap_calib.time <= (strain_calib_time[-1] * 0.001)
+        ]
+
+    strain_calib_interp = strain_mocap_interpolation(
+        strain_data=strain_calib,
+        mocap_data=mocap_calib,
+        strain_freq=hyperparameter_defaults["sampling_freq"]
+        )
+    #############################
+    # By index
+    # part 1: 400:18500
+    # part 2: 20000:23500
+    # part 3: 27500:41200
+    # part 4: 53000:61800
+    # part 5: 71800:81200
+    # part 6: 87800:90200
+    # part 7: 91100:98400
+    # part 8: 104200:109800
+
+    # Final indexing
+    final_strain_data = []
+    final_angle_data = []
+    for final_ind in np.arange(len(mocap_index_list)):
+        start_ind = mocap_index_list[final_ind][0]
+        end_ind = mocap_index_list[final_ind][1]
+
+        final_strain_data.extend(strain_calib_interp
+                                 [start_ind:end_ind + 1].values)
+
+        final_angle_data.extend(
+            np.array(mocap_calib.angle)[start_ind:end_ind + 1]
+            )
+        # plt.plot(mocap_calib_interp[start_ind:end_ind + 1])
+    calib_df["strain"] = final_strain_data
+    calib_df["angle"] = final_angle_data
     #############################
     # data split
     main_emg_data = main_df   # dataframe (32 columns)
     main_strain_data = main_df["strain"]  # Series
-    calib_strain_data = np.array(main_df["strain"])  # np.array
-    calib_angle_data = np.array(main_df["strain"])  # np.array
+    calib_strain_data = np.array(calib_df["strain"])  # np.array
+    calib_angle_data = np.array(calib_df["angle"])  # np.array
+    # plt.plot(calib_angle_data)
     #############################
     # main
     main(
@@ -1543,6 +2268,7 @@ if __name__ == "__main__":
         model_save_dir=model_save_dir,
         history_title=history_title,
         main_emg_data=main_emg_data,
+        mvc_data_list=mvc_list,
         main_strain_data=main_strain_data,
         calib_strain_data=calib_strain_data,
         calib_angle_data=calib_angle_data
