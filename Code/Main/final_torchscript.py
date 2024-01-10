@@ -6,6 +6,7 @@ Created on Sat Oct 21 19:39:26 2023
 """
 
 from final_function import *
+from final_training import *
 
 
 # class DataPredictor:
@@ -67,40 +68,30 @@ from final_function import *
 #                     test_loss.append(loss)
 #         return test_loss
 
-model_path = './ViT_model/231021_trial1_2(231013)_ViT_LR0.001.pt'
+model_path = './ViT_model/CYJ_data/231108_trial1(delta_strain_all_dataset)_ViT_LR0.0001.pt'
 device = torch.device('cuda')
 model = ViT_Regression(
-    p=hyperparameter_defaults["patch_size"],
-    model_dim=hyperparameter_defaults["model_dim"],
-    hidden_dim=hyperparameter_defaults["hidden_dim"],
-    hidden1_dim=hyperparameter_defaults["hidden1_dim"],
-    hidden2_dim=hyperparameter_defaults["hidden2_dim"],
-    n_output=hyperparameter_defaults["n_output"],
-    n_heads=hyperparameter_defaults["n_heads"],
-    n_layers=hyperparameter_defaults["n_layers"],
-    n_patches=int(np.floor(float(
-        hyperparameter_defaults["window_size"] /
-        float(1000.0 / hyperparameter_defaults["sampling_freq"])
-        ))),
-    dropout_p=hyperparameter_defaults["dropout_p"],
-    training_phase='p',
-    pool='mean',
-    drop_hidden=True
-    )
+    p=hyperparameter_training['patch_size'],
+    model_dim=hyperparameter_training['model_dim'],
+    hidden_dim=hyperparameter_training['hidden_dim'],
+    hidden1_dim=hyperparameter_training['hidden1_dim'],
+    hidden2_dim=hyperparameter_training['hidden2_dim'],
+    n_output=hyperparameter_training['n_output'],
+    n_heads=hyperparameter_training['n_heads'],
+    n_layers=hyperparameter_training['n_layers'],
+    n_patches=8,
+    dropout_p=hyperparameter_training['dropout_p'],
+    pool='mean'
+    ).to(device)
 model.load_state_dict(
-    torch.load(model_path, map_location=device)
-    )
-model.to(device)
+    torch.load(model_path, map_location=device))
+model.eval()
 
 # 1*400*2*4
 # 1*400*1*1
 with torch.no_grad():
-    model.eval()
     traced_model = torch.jit.trace(
         model,
-        example_inputs=(
-            torch_randn((1, 400, 2, 4)).float().to(device),
-            torch_randn((1, 400, 1, 1)).float().to(device)
-            ),
-        check_trace=False)
-    traced_model.save("./ViT_model/traced_script_module/231021_ViT.pt")
+        example_inputs=torch.randn((1, 8, 20, 20)).float().to(device)
+            )
+traced_model.save("./ViT_model/traced_script_module/231108_ViT2.pt")

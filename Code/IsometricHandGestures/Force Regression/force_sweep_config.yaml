@@ -1,0 +1,46 @@
+# -*- coding: utf-8 -*-
+
+program: main.py
+method: random
+metric:
+    name: Validation Loss
+    goal: minimize
+parameters:
+    LR:
+        values: [0.00001, 0.00005, 0.0001, 0.0005]
+    n_warmup_steps:
+        values: [5, 10, 15]
+    decay_rate:
+        values: [0.98, 0.985, 0.99, 0.995]
+    # model dim
+    model_dim:
+        values: [32, 64, 128]
+    hidden_dim:
+        values: [32, 64, 128, 256]
+    hidden1_dim:
+        values: [32, 64, 128, 256]
+    hidden2_dim:
+        values: [32, 64, 128, 256]
+    n_layer:
+        values: [10, 12, 14]
+    n_heads:
+        values: [8, 16, 32]
+    dropout_p:
+        values: [0.1, 0.2, 0.3]
+    # default
+    n_patch:
+        values: [409]
+    n_output:
+        values: [9]
+    EPOCHS:
+        values: [300]
+    BATCH_SIZE:
+        values: [16]
+    TEST_RATIO:
+        values: [0.25]
+    RANDOM_STATE:
+        values: [42]
+    prj_name:
+        values: ["HD_ViT"]
+    log_interval:
+        values: [5]

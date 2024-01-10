@@ -13,7 +13,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import wandb
+import time
 
+# from pyts.image import GramianAngularField, MarkovTransitionField
 
 from einops.layers.torch import Rearrange
 from einops import rearrange
@@ -1073,10 +1075,10 @@ class mySequential(nn.Sequential):
 
 class Embeddings(nn.Module):
     def __init__(self,
-                 p: int,  # min(2,4) = 2
-                 input_dim: int,  # H * W = 2 * 4
-                 model_dim: int,  # D = 32
-                 n_patches: int,  # N(window sample): 400
+                 p: int,  # 10
+                 input_dim: int,  # 20*20
+                 model_dim: int,  # D = 200 
+                 n_patches: int,  # N = 8
                  dropout_p: float):
         # projected_dim = N * D
         super().__init__()
@@ -1084,9 +1086,19 @@ class Embeddings(nn.Module):
         self.model_dim = model_dim
         self.n_patches = n_patches
         self.dropout_p = dropout_p
-        self.to_patch_embedding = mySequential(
+        # self.to_image_embedding = nn.Sequential(
+        #     # p1=20, p2=10, N1=4, N2=4
+        #     # in_channel: 3, emb_size: 3*p1*p2=600
+        #     # kernel size=(p1, p2)=(20, 10)
+        #     # stride=(p1, p2)=(20, 10)
+        #     nn.Conv2d(3, 600, kernel_size=(20, 10), stride=(20, 10)),
+        #     Rearrange('b e (h) (w) -> b (h w) e'),  # B * 16 * 600
+        #     )
+        self.to_patch_embedding = nn.Sequential(
             OrderedDict(
                 {
+                    # B(=16) * (8+1) * 20 * 20
+                    # B * 1 * 20 * 20
                     "rearrange": Rearrange(
                         'b n (h1 p1) (w1 p2) -> b n (h1 w1 p1 p2)',
                         p1=p, p2=p
@@ -1095,38 +1107,43 @@ class Embeddings(nn.Module):
                 })
         )
         # initialize by strain data
-        self.to_pos_embedding = mySequential(
-            OrderedDict(
-                {
-                    "rearrange": Rearrange(
-                        'b n (h1 p1) (w1 p2) -> b n (h1 w1 p1 p2)',
-                        p1=1, p2=1
-                    ),
-                    "projection": nn.Linear(1, self.model_dim)
-                })
-        )
+        # self.to_pos_embedding = mySequential(
+        #     OrderedDict(
+        #         {
+        #             "rearrange": Rearrange(
+        #                 'b n (h1 p1) (w1 p2) -> b n (h1 w1 p1 p2)',
+        #                 p1=1, p2=1
+        #             ),
+        #             "projection": nn.Linear(
+        #                 8, self.model_dim)
+        #         })
+        # )
         self.cls_token = nn.Parameter(
-            torch_randn((1, 1, self.model_dim))
-        )  # 1 * (1 * D)
-        self.pos_token = nn.Parameter(
-            torch_randn((1, 1, self.model_dim))
-        )  # 1 * (1 * D)
+            torch.randn((1, 1, self.model_dim))
+            )  # 1 * (1 * D)
+        self.pos_emb = nn.Parameter(
+            torch.randn(1, self.n_patches + 1, self.model_dim)
+            )  # 1 * (N+1) * D
+        # self.pos_token = nn.Parameter(
+        #     torch_randn((1, 1, self.model_dim))
+        # )  # 1 * (1 * D)
         self.dropout = nn.Dropout(self.dropout_p)
 
-    def forward(self, emg_input, strain_input):
-        emg_projection = self.to_patch_embedding(emg_input)  # b * N * D
-        strain_projection = self.to_pos_embedding(strain_input)  # b * N * D
-        b, _, _ = emg_projection.shape
+    def forward(self, sensor_input):  # emg_input, strain_input
+        # input_projection = self.to_image_embedding(sensor_input)  # b * N * D
+        input_projection = self.to_patch_embedding(sensor_input)  # b * N * D
+        # strain_projection = self.to_pos_embedding(strain_input)  # b * N * D
+        b, _, _ = input_projection.shape
         cls_token = self.cls_token.repeat(b, 1, 1)  # b * 1 * D
-        pos_token = self.pos_token.repeat(b, 1, 1)  # b * 1 * D
-        pos_emb = nn.Parameter(
-            torch.cat((pos_token, strain_projection), dim=1)
-        )  # b * (N+1) * D
+        # pos_token = self.pos_token.repeat(b, 1, 1)  # b * 1 * D
+        # pos_emb = nn.Parameter(
+        #     torch.cat((pos_token, strain_projection), dim=1)
+        # )  # b * (N+1) * D
         patch_emb = torch.cat(
-            (cls_token, emg_projection), dim=1
+            (cls_token, input_projection), dim=1
         )  # b * (N+1) * D
 
-        return self.dropout(pos_emb + patch_emb)
+        return self.dropout(self.pos_emb + patch_emb)
 
 
 class MultiHeadSelfAttentionLayer(nn.Module):
@@ -1147,10 +1164,12 @@ class MultiHeadSelfAttentionLayer(nn.Module):
         self.linear_qkv = nn.Linear(
             self.model_dim, 3*self.model_dim, bias=False)
         self.projection = nn.Identity()\
-            if self.drop_hidden else mySequential(
+            if self.drop_hidden else nn.Sequential(
                     nn.Linear(self.model_dim, self.model_dim),
                     nn.Dropout(self.dropout_p)
                     )
+        self.dropout = nn.Dropout(p=self.dropout_p)
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, z):
         b, n, _ = z.shape
@@ -1163,10 +1182,13 @@ class MultiHeadSelfAttentionLayer(nn.Module):
             )
         query, key, value = qkv_destack[0], qkv_destack[1], qkv_destack[2]
         qk_att = torch.einsum('bhqd, bhkd -> bhqk', query, key)
-        att = F.softmax(qk_att / self.scaling, dim=-1)
+        # att = F.softmax(qk_att / self.scaling, dim=-1)
+        scaled = qk_att/self.scaling
+        att = self.softmax(scaled)
 
         if self.drop_hidden:
-            att = F.dropout(att, p=self.dropout_p)
+            # att = F.dropout(att, p=self.dropout_p)
+            att = self.dropout(att)
 
         out = torch.einsum('bhal, bhlv -> bhav', att, value)
         out = rearrange(out, "b h n d -> b n (h d)")
@@ -1191,7 +1213,7 @@ class PositionWiseFeedForwardLayer(nn.Module):
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout_p)
 
-        self.block = mySequential(
+        self.block = nn.Sequential(
             self.norm,
             self.fc1,
             self.activation,
@@ -1225,7 +1247,7 @@ class Encoder(nn.Module):
 
         for _ in range(self.n_layers):
             layers.append(
-                mySequential(
+                nn.Sequential(
                     MultiHeadSelfAttentionLayer(
                         self.model_dim,
                         self.n_heads,
@@ -1239,7 +1261,7 @@ class Encoder(nn.Module):
                         )
                 )
             )
-        self.encoder = mySequential(*layers)
+        self.encoder = nn.Sequential(*layers)
 
     def forward(self, z):
         return self.encoder(z)
@@ -1255,6 +1277,7 @@ class RegressionHead(nn.Module):
                  pool: str):
         super().__init__()
 
+        # self.input_dim = input_dim
         self.model_dim = model_dim
         self.n_output = n_output
         self.hidden1_dim = hidden1_dim
@@ -1266,18 +1289,35 @@ class RegressionHead(nn.Module):
 
         self.pool = pool
 
-        self.norm = nn.LayerNorm(self.model_dim)
+        # self.norm = nn.LayerNorm(self.model_dim)
         self.hidden1 = nn.Linear(self.model_dim, self.hidden1_dim)
         self.hidden2 = nn.Linear(self.hidden1_dim, self.hidden2_dim)
         self.hidden = nn.Linear(self.hidden2_dim, self.n_output)
-        self.block = mySequential(
-            self.norm, self.hidden1, self.hidden2, self.hidden
+        self.block = nn.Sequential(
+            self.hidden1, self.hidden2, self.hidden
             )
 
-    def forward(self, encoder_output):
+        # # self.strain_norm = nn.LayerNorm(self.input_dim)
+        # self.strain_embedding = nn.Linear(self.input_dim, self.model_dim)
+        # self.strain_hidden = nn.Linear(self.model_dim, self.hidden2_dim)
+        # self.strain_block = nn.Sequential(
+        #     self.strain_embedding, self.strain_hidden
+        #     )
+
+        # # self.output_norm = nn.LayerNorm(2*self.hidden2_dim)
+        # self.hidden = nn.Linear(2*self.hidden2_dim, self.n_output)
+        # # self.output_block = nn.Sequential(
+        # #     self.output_norm, self.hidden
+        # #     )
+
+    def forward(self, encoder_output):  # encoder_output, strain_input
         y = encoder_output.mean(dim=1)\
             if self.pool == 'mean' else encoder_output[:, 0]
+        # emg_out = self.block(y)
 
+        # strain_out = self.strain_block(strain_input)
+
+        # return self.hidden(torch.cat([emg_out, strain_out], dim=1))
         return self.block(y)
 
 
@@ -1297,9 +1337,9 @@ class ViT_Regression(nn.Module):
                  pool='mean',
                  drop_hidden=True):
         super().__init__()
-        input_dim = (p**2)*2
+        input_dim = (p**2)*1
 
-        self.vit_regress = mySequential(
+        self.vit = nn.Sequential(
             OrderedDict({
                 "embedding": Embeddings(
                     p, input_dim, model_dim,
@@ -1315,11 +1355,17 @@ class ViT_Regression(nn.Module):
                     )
             })
         )
+        # self.regression = RegressionHead(
+        #     input_dim,
+        #     model_dim, n_output, hidden1_dim,
+        #     hidden2_dim, training_phase, pool
+        #     )
 
-    def forward(self, emg_input, strain_input):
+    def forward(self, sensor_input):
         # emg_input = inputs[0]
         # strain_input = inputs[1]
-        return self.vit_regress(emg_input, strain_input)
+        # return self.regression(self.vit(emg_input), strain_input)
+        return self.vit(sensor_input)
 
 
 ################################################################
@@ -1366,52 +1412,59 @@ class ScheduleOptim():
 
 
 def train(
-        model, train_loader, scheduler, epoch, criterion, device,
+        model, train_loader, optimizer, scheduler, epoch, criterion, device,
         opt, wandb_set=False
         ):
     model.train()
     train_loss = 0.0
+    print('Training start.')
+    total_time = 0
 
     tqdm_bar = tqdm(enumerate(train_loader))
 
-    for batch_idx, (emg, strain, label) in tqdm_bar:
-        emg = emg.to(device)
-        strain = strain.to(device)
+    for batch_idx, (sensor_input, label) in tqdm_bar:
+        start = time.time()
+        sensor_input = sensor_input.to(device)
 
         label = label.to(torch.float32)
         label = label.to(device)
 
-        scheduler.zero_grad()
+        optimizer.zero_grad()
         # inputs = [emg, strain]
-        output = model(emg, strain)
+        output = model(sensor_input)
         loss = criterion(output, label)
         train_loss += loss.item()
 
         loss.backward()
-        scheduler.step()
+        optimizer.step()
+        # scheduler.step()
         tqdm_bar.set_description(
             "Epoch {} batch {} - train loss: {:.6f}".format(
                 epoch, (batch_idx), loss.item()
                 )
             )
+        total_time += time.time() - start
         if wandb_set == 1:
-            wandb.log(
-                {
-                    "Learning Rate": scheduler.get_lr()
-                }
-            )
-            if (opt.log_interval > 0) and\
-                    ((batch_idx + 1) % opt.log_interval == 0):
-                wandb.log(
-                    {
-                        "Training Loss": round(
-                            train_loss / opt.log_interval, 6
-                            )
-                    }
-                )
+            wandb.watch(model, criterion, 'all')
+            wandb.log({"Inference time": total_time})
+            # wandb.log(
+            #     {
+            #         "Learning Rate": scheduler.get_lr()
+            #     }
+            # )
+            # if (opt['log_interval'] > 0) and\
+            #         ((batch_idx + 1) % opt['log_interval'] == 0):
+            #     wandb.log(
+            #         {
+            #             "Training Loss": round(
+            #                 train_loss / opt['log_interval'], 6
+            #                 )
+            #         }
+            #     )
 
-    scheduler.update()
-    train_loss /= len(train_loader.dataset)
+    scheduler.step(train_loss)
+    # scheduler.update()
+    train_loss /= len(train_loader)
 
     return train_loss
 
@@ -1426,22 +1479,21 @@ def evaluate(
     tqdm_bar = tqdm(enumerate(test_loader))
 
     with torch.no_grad():
-        for batch_idx, (emg, strain, label) in tqdm_bar:
-            emg = emg.to(device)
-            strain = strain.to(device)
+        for batch_idx, (sensor_input, label) in tqdm_bar:
+            sensor_input = sensor_input.to(device)
             label = label.to(torch.float32)
 
-            print("label")
-            print(label)
+            # print("label")
+            # print(label)
             label = label.to(device)
 
             # inputs = [emg, strain]
             # print("input")
             # print(emg.shape)
             # print(strain.shape)
-            output = model(emg, strain)
-            print("output")
-            print(output)
+            output = model(sensor_input)
+            # print("output")
+            # print(output)
 
             loss = criterion(output, label)
             test_loss += loss.item()
@@ -1464,6 +1516,145 @@ def evaluate(
     return test_loss
 
 
+def sweep_evaluate(
+        model, validation_loader, random_loader,
+        criterion, device, opt, wandb_set=False
+        ):
+    model.eval()
+    test_loss = 0.0
+    validation_loss = 0.0
+    random_loss = 0.0
+
+    tqdm_validation_bar = tqdm(enumerate(validation_loader))
+    tqdm_random_bar = tqdm(enumerate(random_loader))
+
+    with torch.no_grad():
+        for batch_idx, (sensor_input, label) in tqdm_validation_bar:
+            sensor_input = sensor_input.to(device)
+            label = label.to(torch.float32)
+            label = label.to(device)
+
+            output = model(sensor_input)
+            
+            loss = criterion(output, label)
+            test_loss += loss.item()
+            validation_loss += loss.item()
+
+            tqdm_validation_bar.set_description(
+                "Validation step: {} || Validation loss: {:.6f}".format(
+                    (batch_idx + 1) / len(validation_loader), loss.item()
+                    )
+                )
+        validation_loss /= len(validation_loader.dataset)
+    with torch.no_grad():
+        for batch_idx, (sensor_input, label) in tqdm_random_bar:
+            sensor_input = sensor_input.to(device)
+            label = label.to(torch.float32)
+            label = label.to(device)
+
+            output = model(sensor_input)
+            
+            loss = criterion(output, label)
+            test_loss += loss.item()
+            random_loss += loss.item()
+
+            tqdm_random_bar.set_description(
+                "Random step: {} || Random loss: {:.6f}".format(
+                    (batch_idx + 1) / len(random_loader), loss.item()
+                    )
+                )
+        random_loss /= len(random_loader.dataset)
+        test_loss /= (len(validation_loader.dataset)+len(random_loader.dataset)) 
+        if wandb_set == 1:
+            wandb.log(
+                {
+                    'Test Loss':
+                        round(test_loss, 6)
+                }
+            )
+
+    return test_loss, validation_loss, random_loss
+
+
+def print_evaluate(
+        model, validation_loader, random_loader,
+        criterion, device, opt, wandb_set=False
+        ):
+    model.eval()
+    test_loss = 0.0
+    validation_loss = 0.0
+    random_loss = 0.0
+    inference_time = 0.0
+    total_num = 0
+    history = {
+        'validation_RMSE': [], 'random_RMSE': [],
+        'validation_true': [], 'validation_prediction': [],
+        'random_true': [], 'random_prediction': []}
+
+    tqdm_validation_bar = tqdm(enumerate(validation_loader))
+    tqdm_random_bar = tqdm(enumerate(random_loader))
+
+    with torch.no_grad():
+        for batch_idx, (sensor_input, label) in tqdm_validation_bar:
+            sensor_input = sensor_input.to(device)
+            label = label.to(torch.float32)
+            label = label.to(device)
+
+            val_start = time.time()
+            output = model(sensor_input)
+            val_end = time.time()
+            inference_time += (val_end - val_start)
+            total_num += 1
+            
+            history['validation_true'].append(label.item())
+            history['validation_prediction'].append(output.item())
+            
+            loss = criterion(output, label)
+            
+            history['validation_RMSE'].append(loss.item())
+            
+            test_loss += loss.item()
+            validation_loss += loss.item()
+
+            tqdm_validation_bar.set_description(
+                "Validation step: {} || Validation loss: {:.6f}".format(
+                    (batch_idx + 1) / len(validation_loader), loss.item()
+                    )
+                )
+        validation_loss /= len(validation_loader.dataset)
+    with torch.no_grad():
+        for batch_idx, (sensor_input, label) in tqdm_random_bar:
+            sensor_input = sensor_input.to(device)
+            label = label.to(torch.float32)
+            label = label.to(device)
+
+            random_start = time.time()
+            output = model(sensor_input)
+            random_end = time.time()
+            inference_time += (random_end - random_start)
+            total_num += 1
+            
+            history['random_true'].append(label.item())
+            history['random_prediction'].append(output.item())
+            
+            loss = criterion(output, label)
+            
+            history['random_RMSE'].append(loss.item())
+            
+            test_loss += loss.item()
+            random_loss += loss.item()
+
+            tqdm_random_bar.set_description(
+                "Random step: {} || Random loss: {:.6f}".format(
+                    (batch_idx + 1) / len(random_loader), loss.item()
+                    )
+                )
+        random_loss /= len(random_loader.dataset)
+        test_loss /= (len(validation_loader.dataset)+len(random_loader.dataset))
+
+    return test_loss, validation_loss, random_loss, history, inference_time, total_num
+
+
 class CustomDataset(Dataset):
     def __init__(self, w_emg, w_strain, w_label):
         self.emg = w_emg
@@ -1474,17 +1665,17 @@ class CustomDataset(Dataset):
         return len(self.label)
 
     def __getitem__(self, idx):
-        emg = torch.DoubleTensor(self.emg[idx])
-        strain = torch.DoubleTensor(self.strain[idx])
-        label = torch.DoubleTensor(self.label[idx])
+        emg = torch.Tensor(self.emg[idx])
+        strain = torch.Tensor(self.strain[idx])
+        label = torch.Tensor(self.label[idx])
         return emg, strain, label
 
     def collate_fn(self, data):
         batch_emg, batch_strain, batch_label = [], [], []
         for emg, strain, label in data:
-            emg = torch.DoubleTensor(emg)
-            strain = torch.DoubleTensor(strain)
-            label = torch.DoubleTensor(label)
+            emg = torch.Tensor(emg)
+            strain = torch.Tensor(strain)
+            label = torch.Tensor(label)
             batch_emg.append(emg)
             batch_strain.append(strain)
             batch_label.append(label)
@@ -1492,6 +1683,31 @@ class CustomDataset(Dataset):
         batch_strain = torch.stack(batch_strain, dim=0).float()
         batch_label = torch.stack(batch_label, dim=0).float()
         return batch_emg, batch_strain, batch_label
+
+
+class CustomDataset_case1(Dataset):
+    def __init__(self, w_input, w_label):
+        self.input = w_input
+        self.label = w_label
+
+    def __len__(self):
+        return len(self.label)
+
+    def __getitem__(self, idx):
+        sensor_input = torch.Tensor(self.input[idx])
+        label = torch.Tensor(self.label[idx])
+        return sensor_input, label
+
+    def collate_fn(self, data):
+        batch_input, batch_label = [], []
+        for sensor_input, label in data:
+            sensor_input = torch.Tensor(sensor_input)
+            label = torch.Tensor(label)
+            batch_input.append(sensor_input)
+            batch_label.append(label)
+        batch_input = torch.stack(batch_input, dim=0).float()
+        batch_label = torch.stack(batch_label, dim=0).float()
+        return batch_input, batch_label
 
 
 class RMSELoss(nn.Module):
@@ -1629,7 +1845,6 @@ def plot_history(history, name):
     ax2.set_xlabel("iterations")
     ax2.set_ylabel("LR")
     plt.show()
-    plt.close()
 
 
 # argument number: 25
@@ -2014,262 +2229,262 @@ def main(
 ################################################################
 ################################################################
 
-hyperparameter_defaults = {
-    # Training
-    'random_state': 42,
-    'data_division_num': 10.0,
-    'pool': 'mean',  # or 'cls'
-    'test_size': 0.35,
-    'batch_size': 16,
-    'epochs': 300,
-    'learning_rate': 0.001,
-    # wandb & logging
-    'prj_name': "HD_ViT",
-    'log_interval': 5,
-    # Model
-    'patch_size': 2,  # p
-    'model_dim': 32,
-    'hidden_dim': 64,
-    'hidden1_dim': 16,
-    'hidden2_dim': 4,
-    'n_output': 1,
-    'n_heads': 8,
-    'n_layers': 10,
-    'dropout_p': 0.2,
-    'model_save_dir': "./ViT_model/2310012_test1_ViT.pt",
-    # Scheduler
-    'n_warmup_steps': 10,
-    'decay_rate': 0.99,
-    # Strain calibration
-    'polynomial_order': 2,
-    # preprocessing parameters
-    "emg_height_number": 2,  # 4
-    "emg_width_number": 4,  # 8
-    "strain_height_number": 1,
-    "strain_width_number": 1,
-    "sampling_freq": 2000,  # hz
-    "window_size": 200,  # ms
-    "overlapping_ratio": 0.75,
-    "time_advance": 100,  # ms
-    "label_half_size": 5,  # ms
-    "lowest_freq": 30,
-    "highest_freq": 250,
-    "bandpass_order": 4,
-    "smoothing_window": 10.0,  # ms
-    "data_list": [1, 2, 3, 4, 5],
-    "data_valley_index_dict": {
-        1: [[0, -7], [-5, -1]],
-        2: [[1, -2]],
-        3: [[1, -1]],
-        4: [[0, -2]],
-        5: [[0, -1]]
-        },
-    "mvc_data_list": [1, 2, 3],
-    "mvc_limit": 50.0,  # uV
-    "mvc_quality_value": 0.001,
-    "quality_value": 0.0015
-    }
+# hyperparameter_defaults = {
+#     # Training
+#     'random_state': 42,
+#     'data_division_num': 10.0,
+#     'pool': 'mean',  # or 'cls'
+#     'test_size': 0.35,
+#     'batch_size': 16,
+#     'epochs': 300,
+#     'learning_rate': 0.001,
+#     # wandb & logging
+#     'prj_name': "HD_ViT",
+#     'log_interval': 5,
+#     # Model
+#     'patch_size': 2,  # p
+#     'model_dim': 32,
+#     'hidden_dim': 64,
+#     'hidden1_dim': 16,
+#     'hidden2_dim': 4,
+#     'n_output': 1,
+#     'n_heads': 8,
+#     'n_layers': 10,
+#     'dropout_p': 0.2,
+#     'model_save_dir': "./ViT_model/2310012_test1_ViT.pt",
+#     # Scheduler
+#     'n_warmup_steps': 10,
+#     'decay_rate': 0.99,
+#     # Strain calibration
+#     'polynomial_order': 2,
+#     # preprocessing parameters
+#     "emg_height_number": 2,  # 4
+#     "emg_width_number": 4,  # 8
+#     "strain_height_number": 1,
+#     "strain_width_number": 1,
+#     "sampling_freq": 2000,  # hz
+#     "window_size": 200,  # ms
+#     "overlapping_ratio": 0.75,
+#     "time_advance": 100,  # ms
+#     "label_half_size": 5,  # ms
+#     "lowest_freq": 30,
+#     "highest_freq": 250,
+#     "bandpass_order": 4,
+#     "smoothing_window": 10.0,  # ms
+#     "data_list": [1, 2, 3, 4, 5],
+#     "data_valley_index_dict": {
+#         1: [[0, -7], [-5, -1]],
+#         2: [[1, -2]],
+#         3: [[1, -1]],
+#         4: [[0, -2]],
+#         5: [[0, -1]]
+#         },
+#     "mvc_data_list": [1, 2, 3],
+#     "mvc_limit": 50.0,  # uV
+#     "mvc_quality_value": 0.001,
+#     "quality_value": 0.0015
+#     }
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
-    model_save_dir = "./ViT_model/231021_trial1_2(231013)_ViT_LR%s.pt" %\
-        str(hyperparameter_defaults["learning_rate"])
-    history_title = "231021_trial1_2(231013)_ViT_LR_%s" %\
-        str(hyperparameter_defaults["learning_rate"])
+#     model_save_dir = "./ViT_model/231021_trial1_2(231013)_ViT_LR%s.pt" %\
+#         str(hyperparameter_defaults["learning_rate"])
+#     history_title = "231021_trial1_2(231013)_ViT_LR_%s" %\
+#         str(hyperparameter_defaults["learning_rate"])
 
-    #############################
-    # Path Reading
-    #############################
-    mvc_path = './Test_data/1013/1013_HSJ_312_test_MVC_'
-    mvc_sheet = ""
+#     #############################
+#     # Path Reading
+#     #############################
+#     mvc_path = './Test_data/1013/1013_HSJ_312_test_MVC_'
+#     mvc_sheet = ""
 
-    main_path = "./Test_data/1013/1013_HSJ_312_test_set"
-    main_sheet = ""
+#     main_path = "./Test_data/1013/1013_HSJ_312_test_set"
+#     main_sheet = ""
 
-    strain_calib_txt_path =\
-        './Test_data/1013/1013_HSJ_314_strain_calibration.txt'
-    mocap_calib_csv_path = './Test_data/1013/HSJ_Mocap_after_EMG.csv'
-    mocap_column_list = [
-        "frame", "time",
-        "biceps_x", "biceps_y", "biceps_z",
-        "elbow_x", "elbow_y", "elbow_z",
-        "forearm_x", "forearm_y", "forearm_z",
-        "shoulder_x", "shoulder_y", "shoulder_z",
-        "wrist_lateral_x", "wrist_lateral_y", "wrist_lateral_z",
-        "wrist_medial_x", "wrist_medial_y", "wrist_medial_z"]
-    mocap_index_list = [
-        [400, 18500],
-        [20000, 23500],
-        [27500, 41200],
-        [53000, 61800],
-        [71800, 81200],
-        [87800, 90200],
-        [91100, 98400],
-        [104200, 109800]
-        ]
-    #############################
-    # Data Reading
-    #############################
-    # data list for emg mvc
-    mvc_list = list()
-    for mvc_ind in hyperparameter_defaults["mvc_data_list"]:
-        each_mvc_path = mvc_path + str(mvc_ind) + '.txt'
-        mvc_data_list = emg_data_txt_reading_231011(
-             each_mvc_path, mvc_sheet
-             )
-        mvc_df = pd.DataFrame()
-        for i in np.arange(len(mvc_data_list) - 1):
-            mvc_df["emg" + str(i + 1)] = mvc_data_list[i]
-        mvc_df.reset_index(drop=True, inplace=True)
-        mvc_list.append(mvc_df)  # list(dataframe)
-    #############################
-    # data for emg + strain
-    main_df = pd.DataFrame()
-    for main_ind in hyperparameter_defaults["data_list"]:
-        each_main_path = main_path + str(main_ind) + '.txt'
-        main_data_list = emg_data_txt_reading_231011(
-            each_main_path, main_sheet
-            )
+#     strain_calib_txt_path =\
+#         './Test_data/1013/1013_HSJ_314_strain_calibration.txt'
+#     mocap_calib_csv_path = './Test_data/1013/HSJ_Mocap_after_EMG.csv'
+#     mocap_column_list = [
+#         "frame", "time",
+#         "biceps_x", "biceps_y", "biceps_z",
+#         "elbow_x", "elbow_y", "elbow_z",
+#         "forearm_x", "forearm_y", "forearm_z",
+#         "shoulder_x", "shoulder_y", "shoulder_z",
+#         "wrist_lateral_x", "wrist_lateral_y", "wrist_lateral_z",
+#         "wrist_medial_x", "wrist_medial_y", "wrist_medial_z"]
+#     mocap_index_list = [
+#         [400, 18500],
+#         [20000, 23500],
+#         [27500, 41200],
+#         [53000, 61800],
+#         [71800, 81200],
+#         [87800, 90200],
+#         [91100, 98400],
+#         [104200, 109800]
+#         ]
+#     #############################
+#     # Data Reading
+#     #############################
+#     # data list for emg mvc
+#     mvc_list = list()
+#     for mvc_ind in hyperparameter_defaults["mvc_data_list"]:
+#         each_mvc_path = mvc_path + str(mvc_ind) + '.txt'
+#         mvc_data_list = emg_data_txt_reading_231011(
+#              each_mvc_path, mvc_sheet
+#              )
+#         mvc_df = pd.DataFrame()
+#         for i in np.arange(len(mvc_data_list) - 1):
+#             mvc_df["emg" + str(i + 1)] = mvc_data_list[i]
+#         mvc_df.reset_index(drop=True, inplace=True)
+#         mvc_list.append(mvc_df)  # list(dataframe)
+#     #############################
+#     # data for emg + strain
+#     main_df = pd.DataFrame()
+#     for main_ind in hyperparameter_defaults["data_list"]:
+#         each_main_path = main_path + str(main_ind) + '.txt'
+#         main_data_list = emg_data_txt_reading_231011(
+#             each_main_path, main_sheet
+#             )
 
-        # data indexing (peak)
-        peaks, _ = signal.find_peaks(
-            main_data_list[-1], prominence=300.0
-            )
-        new_peak = []
-        for peak_ind, peak in enumerate(peaks):
-            if peak_ind == 0:
-                new_peak.append(peak)
-                continue
-            if peak - new_peak[-1] <= 2000:
-                continue
-            new_peak.append(peak)
-        # data indexing (valley)
-        valleys, _ = signal.find_peaks(
-            (-1) * main_data_list[-1], prominence=100.0
-            )
-        new_valley = []
-        for valley_ind, valley in enumerate(valleys):
-            if valley_ind == 0:
-                new_valley.append(valley)
-                continue
-            if valley - new_valley[-1] <= 2000:
-                continue
-            new_valley.append(valley)
+#         # data indexing (peak)
+#         peaks, _ = signal.find_peaks(
+#             main_data_list[-1], prominence=300.0
+#             )
+#         new_peak = []
+#         for peak_ind, peak in enumerate(peaks):
+#             if peak_ind == 0:
+#                 new_peak.append(peak)
+#                 continue
+#             if peak - new_peak[-1] <= 2000:
+#                 continue
+#             new_peak.append(peak)
+#         # data indexing (valley)
+#         valleys, _ = signal.find_peaks(
+#             (-1) * main_data_list[-1], prominence=100.0
+#             )
+#         new_valley = []
+#         for valley_ind, valley in enumerate(valleys):
+#             if valley_ind == 0:
+#                 new_valley.append(valley)
+#                 continue
+#             if valley - new_valley[-1] <= 2000:
+#                 continue
+#             new_valley.append(valley)
 
-        # Append main_df
-        for append_num in np.arange(
-                len(hyperparameter_defaults["data_valley_index_dict"]
-                    [main_ind])
-                ):
-            start_index = hyperparameter_defaults["data_valley_index_dict"]\
-                [main_ind][append_num][0]
-            end_index = hyperparameter_defaults["data_valley_index_dict"]\
-                [main_ind][append_num][1]
+#         # Append main_df
+#         for append_num in np.arange(
+#                 len(hyperparameter_defaults["data_valley_index_dict"]
+#                     [main_ind])
+#                 ):
+#             start_index = hyperparameter_defaults["data_valley_index_dict"]\
+#                 [main_ind][append_num][0]
+#             end_index = hyperparameter_defaults["data_valley_index_dict"]\
+#                 [main_ind][append_num][1]
 
-            if len(main_df) == 0:
-                for i in np.arange(len(main_data_list) - 1):
-                    main_df["emg" + str(i + 1)] =\
-                        main_data_list[i][start_index:end_index + 1]
-                main_df["strain"] =\
-                    main_data_list[-1][start_index:end_index + 1]
-            else:
-                for i in np.arange(len(main_data_list) - 1):
-                    main_df["emg" + str(i + 1)] =\
-                        main_df["emg" + str(i + 1)].append(
-                            pd.Series(
-                                main_data_list[i][start_index:end_index + 1]
-                                ),
-                            ignore_index=True
-                            )
-                main_df["strain"] = main_df["strain"].append(
-                    pd.Series(
-                        main_data_list[-1][start_index:end_index + 1]
-                        ),
-                    ignore_index=True
-                    )
-    #############################
-    # data for strain & angle (mocap) -- strain
-    calib_df = pd.DataFrame()
-    strain_calib = strain_data_txt_reading(
-        path=strain_calib_txt_path,
-        sheet_name="")
-    # time [ms]
-    strain_calib_time = np.linspace(
-        0,
-        (len(strain_calib) - 1) *
-        (1000.0 / hyperparameter_defaults["sampling_freq"]),
-        len(strain_calib)
-        )
-    #############################
-    # By index
-    # part 1: 7000:310000
-    # part 2: 458000:688000
-    # part 3: 884000:1030000
-    # part 4: 1196000:1354000
-    # part 5: 1465000:1504000
-    # part 6: 1518000:1641000
-    # part 7: 1736500:1825000
+#             if len(main_df) == 0:
+#                 for i in np.arange(len(main_data_list) - 1):
+#                     main_df["emg" + str(i + 1)] =\
+#                         main_data_list[i][start_index:end_index + 1]
+#                 main_df["strain"] =\
+#                     main_data_list[-1][start_index:end_index + 1]
+#             else:
+#                 for i in np.arange(len(main_data_list) - 1):
+#                     main_df["emg" + str(i + 1)] =\
+#                         main_df["emg" + str(i + 1)].append(
+#                             pd.Series(
+#                                 main_data_list[i][start_index:end_index + 1]
+#                                 ),
+#                             ignore_index=True
+#                             )
+#                 main_df["strain"] = main_df["strain"].append(
+#                     pd.Series(
+#                         main_data_list[-1][start_index:end_index + 1]
+#                         ),
+#                     ignore_index=True
+#                     )
+#     #############################
+#     # data for strain & angle (mocap) -- strain
+#     calib_df = pd.DataFrame()
+#     strain_calib = strain_data_txt_reading(
+#         path=strain_calib_txt_path,
+#         sheet_name="")
+#     # time [ms]
+#     strain_calib_time = np.linspace(
+#         0,
+#         (len(strain_calib) - 1) *
+#         (1000.0 / hyperparameter_defaults["sampling_freq"]),
+#         len(strain_calib)
+#         )
+#     #############################
+#     # By index
+#     # part 1: 7000:310000
+#     # part 2: 458000:688000
+#     # part 3: 884000:1030000
+#     # part 4: 1196000:1354000
+#     # part 5: 1465000:1504000
+#     # part 6: 1518000:1641000
+#     # part 7: 1736500:1825000
 
-    #############################
-    # data for strain & angle (mocap) -- mocap
-    mocap_calib = mocap_data_csv_reading(
-        mocap_calib_csv_path,
-        mocap_column_list,
-        angle_option=2  # biceps-elbow-forearm
-        )
-    mocap_calib = mocap_calib[
-        mocap_calib.time <= (strain_calib_time[-1] * 0.001)
-        ]
+#     #############################
+#     # data for strain & angle (mocap) -- mocap
+#     mocap_calib = mocap_data_csv_reading(
+#         mocap_calib_csv_path,
+#         mocap_column_list,
+#         angle_option=2  # biceps-elbow-forearm
+#         )
+#     mocap_calib = mocap_calib[
+#         mocap_calib.time <= (strain_calib_time[-1] * 0.001)
+#         ]
 
-    strain_calib_interp = strain_mocap_interpolation(
-        strain_data=strain_calib,
-        mocap_data=mocap_calib,
-        strain_freq=hyperparameter_defaults["sampling_freq"]
-        )
-    #############################
-    # By index
-    # part 1: 400:18500
-    # part 2: 20000:23500
-    # part 3: 27500:41200
-    # part 4: 53000:61800
-    # part 5: 71800:81200
-    # part 6: 87800:90200
-    # part 7: 91100:98400
-    # part 8: 104200:109800
+#     strain_calib_interp = strain_mocap_interpolation(
+#         strain_data=strain_calib,
+#         mocap_data=mocap_calib,
+#         strain_freq=hyperparameter_defaults["sampling_freq"]
+#         )
+#     #############################
+#     # By index
+#     # part 1: 400:18500
+#     # part 2: 20000:23500
+#     # part 3: 27500:41200
+#     # part 4: 53000:61800
+#     # part 5: 71800:81200
+#     # part 6: 87800:90200
+#     # part 7: 91100:98400
+#     # part 8: 104200:109800
 
-    # Final indexing
-    final_strain_data = []
-    final_angle_data = []
-    for final_ind in np.arange(len(mocap_index_list)):
-        start_ind = mocap_index_list[final_ind][0]
-        end_ind = mocap_index_list[final_ind][1]
+#     # Final indexing
+#     final_strain_data = []
+#     final_angle_data = []
+#     for final_ind in np.arange(len(mocap_index_list)):
+#         start_ind = mocap_index_list[final_ind][0]
+#         end_ind = mocap_index_list[final_ind][1]
 
-        final_strain_data.extend(strain_calib_interp
-                                 [start_ind:end_ind + 1].values)
+#         final_strain_data.extend(strain_calib_interp
+#                                  [start_ind:end_ind + 1].values)
 
-        final_angle_data.extend(
-            np.array(mocap_calib.angle)[start_ind:end_ind + 1]
-            )
-        # plt.plot(mocap_calib_interp[start_ind:end_ind + 1])
-    calib_df["strain"] = final_strain_data
-    calib_df["angle"] = final_angle_data
-    #############################
-    # data split
-    main_emg_data = main_df   # dataframe (32 columns)
-    main_strain_data = main_df["strain"]  # Series
-    calib_strain_data = np.array(calib_df["strain"])  # np.array
-    calib_angle_data = np.array(calib_df["angle"])  # np.array
-    # plt.plot(calib_angle_data)
-    #############################
-    # main
-    main(
-        wandb_set=False,
-        hyperparameter_defaults=hyperparameter_defaults,
-        model_save_dir=model_save_dir,
-        history_title=history_title,
-        main_emg_data=main_emg_data,
-        mvc_data_list=mvc_list,
-        main_strain_data=main_strain_data,
-        calib_strain_data=calib_strain_data,
-        calib_angle_data=calib_angle_data
-        )
+#         final_angle_data.extend(
+#             np.array(mocap_calib.angle)[start_ind:end_ind + 1]
+#             )
+#         # plt.plot(mocap_calib_interp[start_ind:end_ind + 1])
+#     calib_df["strain"] = final_strain_data
+#     calib_df["angle"] = final_angle_data
+#     #############################
+#     # data split
+#     main_emg_data = main_df   # dataframe (32 columns)
+#     main_strain_data = main_df["strain"]  # Series
+#     calib_strain_data = np.array(calib_df["strain"])  # np.array
+#     calib_angle_data = np.array(calib_df["angle"])  # np.array
+#     # plt.plot(calib_angle_data)
+#     #############################
+#     # main
+#     main(
+#         wandb_set=False,
+#         hyperparameter_defaults=hyperparameter_defaults,
+#         model_save_dir=model_save_dir,
+#         history_title=history_title,
+#         main_emg_data=main_emg_data,
+#         mvc_data_list=mvc_list,
+#         main_strain_data=main_strain_data,
+#         calib_strain_data=calib_strain_data,
+#         calib_angle_data=calib_angle_data
+#         )
